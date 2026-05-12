@@ -1,0 +1,592 @@
+import { useState, useRef, useEffect, useCallback } from "react";
+
+// ── Math helpers ──────────────────────────────────────────────────────────────
+const PI = Math.PI;
+const deg = r => r * 180 / PI;
+const rad = d => d * PI / 180;
+const bearingToXY = (b, s) => ({ x: s * Math.sin(rad(b)), y: s * Math.cos(rad(b)) });
+const xyToBearing = (x, y) => ((deg(Math.atan2(x, y)) + 360) % 360);
+const xyToSpeed = (x, y) => Math.sqrt(x * x + y * y);
+const fmtBearing = d => `${Math.round(d).toString().padStart(3, "0")}°`;
+const fmtDec = d => d.toFixed(2) + "°";
+
+// ── Levels ────────────────────────────────────────────────────────────────────
+const LEVELS = [
+  { level: 1, hint: "East-bound with a northerly crosswind",        airspeed: 400, heading: 90,  windSpeed: 60,  windFrom: 0   },
+  { level: 2, hint: "North-bound, wind blowing from the east",      airspeed: 600, heading: 0,   windSpeed: 100, windFrom: 90  },
+  { level: 3, hint: "Classic diagonal problem — from the notes",    airspeed: 900, heading: 210, windSpeed: 150, windFrom: 115 },
+  { level: 4, hint: "NW headwind on a NE flight",                   airspeed: 750, heading: 45,  windSpeed: 200, windFrom: 315 },
+];
+
+function getAnswer(lv) {
+  const windToward = (lv.windFrom + 180) % 360;
+  const p = bearingToXY(lv.heading, lv.airspeed);
+  const w = bearingToXY(windToward, lv.windSpeed);
+  const gx = p.x + w.x, gy = p.y + w.y;
+  return { speed: xyToSpeed(gx, gy), bearing: xyToBearing(gx, gy) };
+}
+
+function getTheta(lv) {
+  const windToward = (lv.windFrom + 180) % 360;
+  let diff = Math.abs(windToward - lv.heading);
+  if (diff > 180) diff = 360 - diff;
+  return 180 - diff;
+}
+
+function getAlphaSign(lv) {
+  const windToward = (lv.windFrom + 180) % 360;
+  const fromHeading = (windToward - lv.heading + 360) % 360;
+  return fromHeading < 180 ? 1 : -1;
+}
+
+// ── Diagram SVG ───────────────────────────────────────────────────────────────
+const DW = 580, DH = 580;
+
+function getOriginXY(lv, scale) {
+  const windToward = (lv.windFrom + 180) % 360;
+  const p = bearingToXY(lv.heading, lv.airspeed);
+  const w = bearingToXY(windToward, lv.windSpeed);
+  const pts = [
+    [0, 0],
+    [p.x * scale, -p.y * scale],
+    [(p.x + w.x) * scale, -(p.y + w.y) * scale],
+  ];
+  const minX = Math.min(...pts.map(p => p[0]));
+  const maxX = Math.max(...pts.map(p => p[0]));
+  const minY = Math.min(...pts.map(p => p[1]));
+  const maxY = Math.max(...pts.map(p => p[1]));
+  const pad = 80;
+  const cx = pad - minX + (DW - pad * 2 - (maxX - minX)) / 2;
+  const cy = pad - minY + (DH - pad * 2 - (maxY - minY)) / 2;
+  return [cx, cy];
+}
+
+function ArrowMarker({ id, color }) {
+  return (
+    <marker id={id} viewBox="0 0 12 12" refX="10" refY="6" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 1 L 11 6 L 0 11 z" fill={color} />
+    </marker>
+  );
+}
+
+// Label with auto-repositioning to avoid overlaps
+function VecLabel({ x1, y1, x2, y2, text, color, bgColor, offsetDir = 1 }) {
+  const mx = (x1 + x2) / 2;
+  const my = (y1 + y2) / 2;
+  // Perpendicular offset
+  const dx = x2 - x1, dy = y2 - y1;
+  const len = Math.sqrt(dx * dx + dy * dy) || 1;
+  const px = -dy / len * 28 * offsetDir;
+  const py = dx / len * 28 * offsetDir;
+  const lx = mx + px, ly = my + py;
+  const w = text.length * 7.2 + 16;
+  return (
+    <g>
+      <rect x={lx - w / 2} y={ly - 12} width={w} height={20} rx={5} fill={bgColor} opacity={0.93} />
+      <text x={lx} y={ly + 3} fontSize="12" fontWeight="700" fill={color} textAnchor="middle"
+        fontFamily="'JetBrains Mono','Fira Mono',monospace">{text}</text>
+    </g>
+  );
+}
+
+function VectorDiagram({ lv, phase, dragBearing, onDragBearing }) {
+  const svgRef = useRef(null);
+  const isDragging = useRef(false);
+
+  const windToward = (lv.windFrom + 180) % 360;
+  const scale = 220 / lv.airspeed;
+
+  const [ox, oy] = getOriginXY(lv, scale);
+  const toSVG = (bx, by) => [ox + bx * scale, oy - by * scale];
+
+  const p = bearingToXY(lv.heading, lv.airspeed);
+  const w = bearingToXY(windToward, lv.windSpeed);
+  const ans = getAnswer(lv);
+
+  const [px, py] = toSVG(p.x, p.y);
+  const [wx, wy] = toSVG(p.x + w.x, p.y + w.y);
+
+  // Draggable ground vector tip
+  const gLen = ans.speed * scale;
+  const dragBearingRad = rad(dragBearing);
+  const gTipX = ox + gLen * Math.sin(dragBearingRad);
+  const gTipY = oy - gLen * Math.cos(dragBearingRad);
+
+  const theta = getTheta(lv);
+
+  // Drag handlers
+  const getBearingFromEvent = useCallback((e) => {
+    const svg = svgRef.current;
+    const rect = svg.getBoundingClientRect();
+    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+    const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+    const scaleX = DW / rect.width;
+    const scaleY = DH / rect.height;
+    const sx = (clientX - rect.left) * scaleX;
+    const sy = (clientY - rect.top) * scaleY;
+    const dx = sx - ox, dy = -(sy - oy);
+    return (xyToBearing(dx, dy) + 360) % 360;
+  }, [ox, oy]);
+
+  const handleMouseDown = (e) => { if (phase !== "bearing") return; isDragging.current = true; e.preventDefault(); };
+  const handleMouseMove = useCallback((e) => {
+    if (!isDragging.current || phase !== "bearing") return;
+    onDragBearing(getBearingFromEvent(e));
+  }, [phase, getBearingFromEvent, onDragBearing]);
+  const handleMouseUp = () => { isDragging.current = false; };
+
+  useEffect(() => {
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("mouseup", handleMouseUp);
+    window.addEventListener("touchmove", handleMouseMove, { passive: false });
+    window.addEventListener("touchend", handleMouseUp);
+    return () => {
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", handleMouseUp);
+      window.removeEventListener("touchmove", handleMouseMove);
+      window.removeEventListener("touchend", handleMouseUp);
+    };
+  }, [handleMouseMove]);
+
+  const showGround = phase === "bearing" || phase === "done";
+  const showCorrectGround = phase === "done";
+
+  // Correct ground tip
+  const corrGLen = ans.speed * scale;
+  const corrBearRad = rad(ans.bearing);
+  const corrGTipX = ox + corrGLen * Math.sin(corrBearRad);
+  const corrGTipY = oy - corrGLen * Math.cos(corrBearRad);
+
+  return (
+    <svg
+      ref={svgRef}
+      width={DW} height={DH}
+      style={{ display: "block", cursor: phase === "bearing" ? "crosshair" : "default", touchAction: "none" }}
+      onMouseDown={handleMouseDown}
+      onTouchStart={handleMouseDown}
+    >
+      <defs>
+        <ArrowMarker id="a-blue"  color="#3b82f6" />
+        <ArrowMarker id="a-red"   color="#ef4444" />
+        <ArrowMarker id="a-green" color="#22c55e" />
+        <ArrowMarker id="a-drag"  color="#f59e0b" />
+        <ArrowMarker id="a-ghost" color="#86efac" />
+        <filter id="glow">
+          <feGaussianBlur stdDeviation="3" result="blur" />
+          <feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
+        </filter>
+      </defs>
+
+      {/* Grid */}
+      {Array.from({ length: 9 }, (_, i) => (
+        <line key={`v${i}`} x1={i * DW / 8} y1={0} x2={i * DW / 8} y2={DH} stroke="#1e293b" strokeWidth="0.5" opacity="0.4" />
+      ))}
+      {Array.from({ length: 9 }, (_, i) => (
+        <line key={`h${i}`} x1={0} y1={i * DH / 8} x2={DW} y2={i * DH / 8} stroke="#1e293b" strokeWidth="0.5" opacity="0.4" />
+      ))}
+
+      {/* Compass axes */}
+      <line x1={ox} y1={12} x2={ox} y2={DH - 12} stroke="#334155" strokeWidth="1.5" />
+      <line x1={12} y1={oy} x2={DW - 12} y2={oy}  stroke="#334155" strokeWidth="1.5" />
+      {[["N", ox + 8, 24], ["S", ox + 8, DH - 8], ["E", DW - 18, oy - 6], ["W", 8, oy - 6]].map(([t, x, y]) => (
+        <text key={t} x={x} y={y} fontSize="14" fill="#64748b" fontWeight="800"
+          fontFamily="'JetBrains Mono','Fira Mono',monospace">{t}</text>
+      ))}
+
+      {/* Origin */}
+      <circle cx={ox} cy={oy} r="7" fill="#0f172a" stroke="#3b82f6" strokeWidth="2" />
+
+      {/* Correct ground vector (shown after done) */}
+      {showCorrectGround && (
+        <>
+          <line x1={ox} y1={oy} x2={corrGTipX} y2={corrGTipY}
+            stroke="#22c55e" strokeWidth="5" strokeDasharray="10 6"
+            markerEnd="url(#a-green)" strokeLinecap="round" filter="url(#glow)" />
+          <VecLabel x1={ox} y1={oy} x2={corrGTipX} y2={corrGTipY}
+            text={`V_G  ${fmtBearing(ans.bearing)} @ ${Math.round(ans.speed)}`}
+            color="#22c55e" bgColor="#052e16" offsetDir={-1} />
+        </>
+      )}
+
+      {/* Draggable ground vector */}
+      {showGround && !showCorrectGround && (
+        <>
+          {/* Ghost correct bearing indicator (subtle) */}
+          <line x1={ox} y1={oy} x2={corrGTipX} y2={corrGTipY}
+            stroke="#22c55e" strokeWidth="2" strokeDasharray="6 8" opacity="0.2"
+            markerEnd="url(#a-ghost)" strokeLinecap="round" />
+          {/* Draggable arrow */}
+          <line x1={ox} y1={oy} x2={gTipX} y2={gTipY}
+            stroke="#f59e0b" strokeWidth="5" strokeDasharray="10 5"
+            markerEnd="url(#a-drag)" strokeLinecap="round" filter="url(#glow)" />
+          <VecLabel x1={ox} y1={oy} x2={gTipX} y2={gTipY}
+            text={`V_G  ${fmtBearing(dragBearing)} @ ${Math.round(ans.speed)}`}
+            color="#f59e0b" bgColor="#1c1400" offsetDir={-1} />
+          {/* Drag hint */}
+          <rect x={DW / 2 - 80} y={DH - 34} width={160} height={22} rx={5} fill="#1e3a5f" opacity={0.85} />
+          <text x={DW / 2} y={DH - 19} textAnchor="middle" fontSize="12" fill="#93c5fd"
+            fontFamily="'JetBrains Mono','Fira Mono',monospace">DRAG to set bearing</text>
+        </>
+      )}
+
+      {/* Plane vector */}
+      <line x1={ox} y1={oy} x2={px} y2={py}
+        stroke="#3b82f6" strokeWidth="6" markerEnd="url(#a-blue)" strokeLinecap="round" />
+      <VecLabel x1={ox} y1={oy} x2={px} y2={py}
+        text={`Plane  ${fmtBearing(lv.heading)} @ ${lv.airspeed}`}
+        color="#93c5fd" bgColor="#0c1a3a" offsetDir={1} />
+
+      {/* Wind vector (tip-to-tail) */}
+      <line x1={px} y1={py} x2={wx} y2={wy}
+        stroke="#ef4444" strokeWidth="5" markerEnd="url(#a-red)" strokeLinecap="round" />
+      <VecLabel x1={px} y1={py} x2={wx} y2={wy}
+        text={`Wind  ${fmtBearing(windToward)} @ ${lv.windSpeed}`}
+        color="#fca5a5" bgColor="#3a0a0a" offsetDir={-1} />
+
+      {/* θ at joint */}
+      <circle cx={px} cy={py} r="6" fill="#f59e0b" />
+      <rect x={px + 8} y={py + 4} width={62} height={20} rx={5} fill="#1c1400" opacity={0.9} />
+      <text x={px + 39} y={py + 17} fontSize="12" fontWeight="800" fill="#fbbf24" textAnchor="middle"
+        fontFamily="'JetBrains Mono','Fira Mono',monospace">θ={Math.round(theta)}°</text>
+    </svg>
+  );
+}
+
+// ── Solution walkthrough ──────────────────────────────────────────────────────
+function SolutionWalkthrough({ lv }) {
+  const windToward = (lv.windFrom + 180) % 360;
+  let diff = Math.abs(windToward - lv.heading);
+  if (diff > 180) diff = 360 - diff;
+  const theta = 180 - diff;
+  const ans = getAnswer(lv);
+  const alpha = deg(Math.asin(lv.windSpeed * Math.sin(rad(theta)) / ans.speed));
+  const alphaSign = getAlphaSign(lv);
+  const newBearing = (lv.heading + alphaSign * alpha + 360) % 360;
+  const vgSq = lv.airspeed ** 2 + lv.windSpeed ** 2 - 2 * lv.airspeed * lv.windSpeed * Math.cos(rad(theta));
+
+  const block = (color, bg, title, lines) => (
+    <div style={{ marginBottom: 14, padding: "12px 14px", background: bg, borderRadius: 10, borderLeft: `3px solid ${color}` }}>
+      <div style={{ color, fontWeight: 800, fontSize: 13, marginBottom: 6, fontFamily: "sans-serif" }}>{title}</div>
+      {lines.map((l, i) => <div key={i} style={{ fontFamily: "'JetBrains Mono','Fira Mono',monospace", fontSize: 12, lineHeight: 1.85, color: "#cbd5e1" }} dangerouslySetInnerHTML={{ __html: l }} />)}
+    </div>
+  );
+
+  return (
+    <div style={{ background: "#0a1628", border: "1px solid #1e3a5f", borderRadius: 14, padding: 18, marginTop: 16 }}>
+      <div style={{ color: "#e2e8f0", fontWeight: 900, fontSize: 15, marginBottom: 14, fontFamily: "sans-serif", display: "flex", alignItems: "center", gap: 8 }}>
+        <span style={{ fontSize: 20 }}>📐</span> Solution Walkthrough
+      </div>
+
+      {block("#f59e0b", "#1c1400",
+        "Step 1 — Interior angle θ",
+        [
+          `Wind FROM ${fmtBearing(lv.windFrom)} → goes TOWARD ${fmtBearing(windToward)}`,
+          `diff = |${Math.round(windToward)}° − ${lv.heading}°| = ${Math.round(diff)}°`,
+          `<strong style="color:#fbbf24">θ = 180° − ${Math.round(diff)}° = ${Math.round(theta)}°</strong>`,
+        ]
+      )}
+
+      {block("#3b82f6", "#0c1a3a",
+        "Step 2 — Law of Cosines (find |V_G|)",
+        [
+          `|V_G|² = a² + w² − 2aw·cos(θ)`,
+          `|V_G|² = ${lv.airspeed}² + ${lv.windSpeed}² − 2(${lv.airspeed})(${lv.windSpeed})·cos(${Math.round(theta)}°)`,
+          `|V_G|² = ${vgSq.toFixed(0)}`,
+          `<strong style="color:#93c5fd">|V_G| = ${ans.speed.toFixed(2)} km/h</strong>`,
+        ]
+      )}
+
+      {block("#22c55e", "#052e16",
+        "Step 3 — Law of Sines (find angle α)",
+        [
+          `${lv.windSpeed} / sin(α) = ${ans.speed.toFixed(2)} / sin(${Math.round(theta)}°)`,
+          `sin(α) = ${lv.windSpeed} × sin(${Math.round(theta)}°) / ${ans.speed.toFixed(2)}`,
+          `<strong style="color:#86efac">α ≈ ${fmtDec(alpha)}</strong>`,
+        ]
+      )}
+
+      {block("#a855f7", "#1a0a2e",
+        "Step 4 — New Bearing",
+        [
+          `New Bearing = Heading ${alphaSign > 0 ? "+" : "−"} α`,
+          `= ${lv.heading}° ${alphaSign > 0 ? "+" : "−"} ${fmtDec(alpha)}`,
+          `<strong style="color:#d8b4fe">≈ ${fmtDec(newBearing)}</strong>`,
+        ]
+      )}
+
+      <div style={{ padding: "10px 14px", background: "#0f2d1a", border: "1px solid #22c55e", borderRadius: 10, fontFamily: "'JetBrains Mono','Fira Mono',monospace", fontSize: 13, color: "#86efac" }}>
+        <strong>∴ V_G</strong> = {ans.speed.toFixed(2)} km/h @ {fmtDec(newBearing)}
+      </div>
+    </div>
+  );
+}
+
+// ── Level pip ─────────────────────────────────────────────────────────────────
+function Pip({ n, active, done }) {
+  return (
+    <div style={{
+      width: 32, height: 32, borderRadius: "50%", display: "flex", alignItems: "center", justifyContent: "center",
+      fontWeight: 900, fontSize: 13, fontFamily: "sans-serif",
+      background: done ? "#22c55e" : active ? "#3b82f6" : "#1e293b",
+      color: done || active ? "white" : "#475569",
+      border: active ? "2px solid #93c5fd" : "2px solid transparent",
+      boxShadow: active ? "0 0 12px #3b82f680" : "none",
+      transition: "all 0.3s",
+    }}>{done ? "✓" : n}</div>
+  );
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────────
+export default function App() {
+  const [lvIdx, setLvIdx] = useState(0);
+  const [speedInput, setSpeedInput] = useState("");
+  const [phase, setPhase] = useState("speed"); // "speed" | "bearing" | "done"
+  const [speedError, setSpeedError] = useState("");
+  const [dragBearing, setDragBearing] = useState(0);
+  const [bearingSnapped, setBearingSnapped] = useState(false);
+  const [complete, setComplete] = useState(false);
+
+  const lv = LEVELS[lvIdx];
+  const ans = getAnswer(lv);
+
+  // Reset on level change
+  const resetLevel = () => {
+    setSpeedInput("");
+    setPhase("speed");
+    setSpeedError("");
+    setDragBearing(lv.heading); // start drag at heading direction
+    setBearingSnapped(false);
+  };
+  useEffect(() => { resetLevel(); }, [lvIdx]);
+
+  const handleSpeedSubmit = () => {
+    const val = parseFloat(speedInput);
+    if (isNaN(val) || val <= 0) { setSpeedError("Enter a positive number."); return; }
+    const diff = Math.abs(val - ans.speed);
+    if (diff > 5) {
+      setSpeedError(`Not quite. Off by ${diff.toFixed(1)} km/h. Try again!`);
+      return;
+    }
+    setSpeedError("");
+    // Correct! Move to bearing phase — start drag from heading direction
+    setDragBearing(lv.heading);
+    setPhase("bearing");
+  };
+
+  const handleBearingConfirm = () => {
+    // Check if within 3°
+    const diff = Math.abs(((dragBearing - ans.bearing + 540) % 360) - 180);
+    if (diff <= 3) {
+      setBearingSnapped(true);
+      setPhase("done");
+    } else {
+      // snap to show it's wrong, let them try again
+      alert(`Close! You're ${diff.toFixed(1)}° off. The correct bearing is ${fmtBearing(ans.bearing)}. Drag to adjust!`);
+    }
+  };
+
+  const handleNext = () => {
+    if (lvIdx + 1 >= LEVELS.length) { setComplete(true); return; }
+    setLvIdx(i => i + 1);
+  };
+
+  // ── Complete screen ──
+  if (complete) {
+    return (
+      <div style={{ minHeight: "100vh", background: "#020817", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "sans-serif" }}>
+        <div style={{ textAlign: "center", color: "white", padding: 40 }}>
+          <div style={{ fontSize: 80, marginBottom: 16 }}>🏆</div>
+          <h1 style={{ fontSize: 42, fontWeight: 900, background: "linear-gradient(135deg,#3b82f6,#22c55e)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent", margin: "0 0 8px" }}>
+            All Missions Complete!
+          </h1>
+          <p style={{ color: "#64748b", fontSize: 16, marginBottom: 32 }}>You've mastered all {LEVELS.length} navigation problems.</p>
+          <div style={{ display: "flex", justifyContent: "center", gap: 10, marginBottom: 40 }}>
+            {LEVELS.map(l => <Pip key={l.level} n={l.level} active={false} done />)}
+          </div>
+          <button onClick={() => { setLvIdx(0); setComplete(false); }}
+            style={{ padding: "14px 40px", background: "linear-gradient(135deg,#3b82f6,#2563eb)", color: "white", border: "none", borderRadius: 12, fontSize: 16, fontWeight: 700, cursor: "pointer" }}>
+            Play Again
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // ── Main game ──
+  const bearingDiff = Math.abs(((dragBearing - ans.bearing + 540) % 360) - 180);
+
+  return (
+    <div style={{ minHeight: "100vh", background: "#020817", color: "white", fontFamily: "sans-serif", padding: "16px 12px" }}>
+      <div style={{ maxWidth: 1120, margin: "0 auto" }}>
+
+        {/* Header */}
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16, flexWrap: "wrap", gap: 12 }}>
+          <div>
+            <h1 style={{ fontSize: 22, fontWeight: 900, margin: 0, letterSpacing: "-0.5px",
+              background: "linear-gradient(135deg,#3b82f6,#22c55e)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>
+              Navigation Problem
+            </h1>
+            <p style={{ fontSize: 12, color: "#64748b", margin: "2px 0 0", fontFamily: "monospace" }}>
+              Level {lvIdx + 1}: {lv.hint}
+            </p>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            {LEVELS.map((l, i) => (
+              <div key={l.level} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <Pip n={l.level} active={i === lvIdx} done={i < lvIdx} />
+                {i < LEVELS.length - 1 && <div style={{ width: 20, height: 2, background: i < lvIdx ? "#22c55e" : "#1e293b", borderRadius: 1 }} />}
+              </div>
+            ))}
+            <span style={{ marginLeft: 8, fontSize: 13, fontWeight: 700, color: "#3b82f6", fontFamily: "monospace" }}>{lvIdx + 1}/{LEVELS.length}</span>
+          </div>
+        </div>
+
+        {/* Body */}
+        <div style={{ display: "flex", gap: 16, flexWrap: "wrap", alignItems: "flex-start" }}>
+
+          {/* Left: diagram */}
+          <div style={{ flex: "0 0 auto", background: "#0b1929", border: "1px solid #1e3a5f", borderRadius: 16, overflow: "hidden" }}>
+            {/* Problem statement */}
+            <div style={{ padding: "14px 20px", borderBottom: "1px solid #1e293b", display: "grid", gridTemplateColumns: "80px 1fr", rowGap: 3, fontSize: 13 }}>
+              <span style={{ color: "#3b82f6", fontWeight: 800 }}>Airplane</span>
+              <span style={{ fontFamily: "monospace" }}>Airspeed&nbsp;<strong>{lv.airspeed} km/h</strong></span>
+              <span />
+              <span style={{ fontFamily: "monospace" }}>Heading&nbsp;&nbsp;<strong>{fmtBearing(lv.heading)}</strong></span>
+              <div style={{ height: 6 }} /><div />
+              <span style={{ color: "#ef4444", fontWeight: 800 }}>Wind</span>
+              <span style={{ fontFamily: "monospace" }}>V_w = <strong>{lv.windSpeed} km/h</strong></span>
+              <span />
+              <span style={{ fontFamily: "monospace" }}>From <strong>{fmtBearing(lv.windFrom)}</strong></span>
+              <div style={{ height: 6 }} /><div />
+              <span style={{ color: "#22c55e", fontWeight: 800 }}>Find</span>
+              <span style={{ fontFamily: "monospace" }}>V_G — Ground Velocity</span>
+            </div>
+
+            <VectorDiagram lv={lv} phase={phase} dragBearing={dragBearing} onDragBearing={setDragBearing} />
+
+            {/* Legend */}
+            <div style={{ padding: "8px 16px 12px", display: "flex", gap: 16, fontSize: 11, flexWrap: "wrap" }}>
+              {[["#3b82f6", "Plane"], ["#ef4444", "Wind (tip-to-tail)"], ["#22c55e", "Ground V_G"]].map(([c, t]) => (
+                <div key={t} style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <span style={{ width: 18, height: 3, background: c, display: "inline-block", borderRadius: 2 }} />
+                  <span style={{ color: "#64748b" }}>{t}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Right: controls */}
+          <div style={{ flex: 1, minWidth: 280, display: "flex", flexDirection: "column", gap: 14 }}>
+
+            {/* Phase indicator */}
+            <div style={{ display: "flex", gap: 0, borderRadius: 10, overflow: "hidden", border: "1px solid #1e3a5f" }}>
+              {[
+                { key: "speed",   label: "① Speed",   icon: "⚡" },
+                { key: "bearing", label: "② Bearing",  icon: "🧭" },
+                { key: "done",    label: "③ Solution", icon: "✅" },
+              ].map(({ key, label, icon }) => {
+                const isActive = phase === key;
+                const isDone = (key === "speed" && (phase === "bearing" || phase === "done")) ||
+                               (key === "bearing" && phase === "done");
+                return (
+                  <div key={key} style={{
+                    flex: 1, padding: "8px 4px", textAlign: "center", fontSize: 12, fontWeight: 700,
+                    background: isActive ? "#1e3a5f" : isDone ? "#052e16" : "#0b1929",
+                    color: isActive ? "#93c5fd" : isDone ? "#86efac" : "#334155",
+                    borderRight: key !== "done" ? "1px solid #1e3a5f" : "none",
+                    transition: "all 0.3s",
+                  }}>
+                    {icon} {label}
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* PHASE: speed */}
+            {phase === "speed" && (
+              <div style={{ background: "#0b1929", border: "1px solid #1e3a5f", borderRadius: 14, padding: 20 }}>
+                <div style={{ fontSize: 14, fontWeight: 800, color: "#e2e8f0", marginBottom: 4 }}>Step 1: Find Ground Speed</div>
+                <div style={{ fontSize: 12, color: "#64748b", marginBottom: 14, fontFamily: "monospace" }}>
+                  Use Law of Cosines: |V_G|² = a² + w² − 2aw·cos(θ)
+                </div>
+                <div style={{ marginBottom: 10 }}>
+                  <label style={{ fontSize: 12, fontWeight: 700, color: "#22c55e", display: "block", marginBottom: 6 }}>
+                    Ground Speed (km/h)
+                  </label>
+                  <input
+                    type="number" min={1} value={speedInput}
+                    onChange={e => { setSpeedInput(e.target.value); setSpeedError(""); }}
+                    onKeyDown={e => e.key === "Enter" && handleSpeedSubmit()}
+                    placeholder="e.g. 925"
+                    style={{
+                      width: "100%", padding: "10px 14px", background: "#0f172a", border: "1px solid #1e3a5f",
+                      borderRadius: 8, color: "white", fontSize: 15, fontFamily: "monospace", outline: "none",
+                      boxSizing: "border-box",
+                    }}
+                  />
+                </div>
+                {speedError && (
+                  <div style={{ padding: "8px 12px", background: "#1a0a0a", border: "1px solid #7f1d1d", borderRadius: 8, fontSize: 12, color: "#fca5a5", fontFamily: "monospace", marginBottom: 10 }}>
+                    {speedError}
+                  </div>
+                )}
+                <button onClick={handleSpeedSubmit}
+                  style={{ width: "100%", padding: "12px", background: "linear-gradient(135deg,#3b82f6,#2563eb)", color: "white", border: "none", borderRadius: 10, fontSize: 14, fontWeight: 700, cursor: "pointer" }}>
+                  Check Speed ⚡
+                </button>
+                <div style={{ marginTop: 10, fontSize: 11, color: "#334155", textAlign: "center" }}>Tolerance: ±5 km/h</div>
+              </div>
+            )}
+
+            {/* PHASE: bearing */}
+            {phase === "bearing" && (
+              <div style={{ background: "#0b1929", border: "1px solid #1e3a5f", borderRadius: 14, padding: 20 }}>
+                <div style={{ padding: "8px 12px", background: "#0f2d1a", border: "1px solid #22c55e", borderRadius: 8, marginBottom: 14 }}>
+                  <span style={{ color: "#86efac", fontFamily: "monospace", fontWeight: 700 }}>✓ Ground Speed: {Math.round(ans.speed)} km/h</span>
+                </div>
+                <div style={{ fontSize: 14, fontWeight: 800, color: "#e2e8f0", marginBottom: 4 }}>Step 2: Set the Bearing</div>
+                <div style={{ fontSize: 12, color: "#64748b", marginBottom: 14, lineHeight: 1.7 }}>
+                  The <span style={{ color: "#f59e0b", fontWeight: 700 }}>yellow arrow</span> appears on the diagram with the correct length.<br />
+                  <strong style={{ color: "#f59e0b" }}>Drag it</strong> to point in the correct direction.
+                </div>
+
+                {/* Live bearing display */}
+                <div style={{ padding: "10px 14px", background: "#1c1400", border: "1px solid #f59e0b", borderRadius: 10, fontFamily: "monospace", marginBottom: 14, textAlign: "center" }}>
+                  <span style={{ fontSize: 13, color: "#fbbf24", fontWeight: 700 }}>Current: {fmtBearing(dragBearing)}</span>
+                  {bearingDiff <= 3 && (
+                    <span style={{ marginLeft: 12, color: "#86efac", fontSize: 12 }}>✓ On target!</span>
+                  )}
+                </div>
+
+                <button onClick={handleBearingConfirm}
+                  style={{ width: "100%", padding: "12px", background: "linear-gradient(135deg,#f59e0b,#d97706)", color: "#0a0a00", border: "none", borderRadius: 10, fontSize: 14, fontWeight: 800, cursor: "pointer" }}>
+                  Lock in Bearing 🧭
+                </button>
+                <div style={{ marginTop: 10, fontSize: 11, color: "#334155", textAlign: "center" }}>Tolerance: ±3°</div>
+              </div>
+            )}
+
+            {/* PHASE: done */}
+            {phase === "done" && (
+              <div style={{ background: "#0b1929", border: "1px solid #1e3a5f", borderRadius: 14, padding: 20 }}>
+                <div style={{ padding: "10px 14px", background: "#0f2d1a", border: "1px solid #22c55e", borderRadius: 10, marginBottom: 16 }}>
+                  <div style={{ color: "#86efac", fontFamily: "monospace", fontWeight: 700, fontSize: 14 }}>
+                    ✓ V_G = {Math.round(ans.speed)} km/h @ {fmtBearing(ans.bearing)}
+                  </div>
+                </div>
+                <button onClick={handleNext}
+                  style={{ width: "100%", padding: "12px", background: "linear-gradient(135deg,#22c55e,#16a34a)", color: "white", border: "none", borderRadius: 10, fontSize: 14, fontWeight: 800, cursor: "pointer" }}>
+                  {lvIdx + 1 < LEVELS.length ? "Next Problem →" : "Finish 🏆"}
+                </button>
+              </div>
+            )}
+
+            {/* Solution walkthrough */}
+            {phase === "done" && <SolutionWalkthrough lv={lv} />}
+
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
